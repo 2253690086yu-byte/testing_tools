@@ -1,0 +1,262 @@
+
+<#
+.SYNOPSIS
+    通用 Go 项目提交前自检（只依赖 go + git，不需要 make / python / diff-cover）
+
+.DESCRIPTION
+    检查项：
+      1. gofmt / gofumpt 格式（CRLF 安全，不会误报）
+      2. go vet
+      3. go build ./...
+      4. go test + 全量覆盖率
+      5. 增量覆盖率（相对基线分支的改动行，自己解析 coverage.out，不需要 diff-cover）
+      6. 非测试代码新增行数上限
+      7. golangci-lint（若已安装）
+
+.EXAMPLE
+    pwsh go-check.ps1
+    pwsh go-check.ps1 -Base origin/main -MinCoverage 68 -MinDiffCoverage 50
+    pwsh go-check.ps1 -Fix          # 只格式化本次改动的文件
+#>
+param(
+    [string] $Base = '',
+    [double] $MinCoverage = 0,
+    [double] $MinDiffCoverage = 0,
+    [int]    $MaxAddedLines = 0,
+    [switch] $Fix,
+    [switch] $SkipLint,
+    [switch] $IncludeTests
+)
+
+$ErrorActionPreference = 'Continue'
+$script:Failed = @()
+$script:Passed = @()
+$script:Warned = @()
+
+function Write-Step([string]$msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
+function Add-Pass([string]$n, [string]$d = '') { $script:Passed += @{ Name = $n; Detail = $d } }
+function Add-Fail([string]$n, [string]$d = '') { $script:Failed += @{ Name = $n; Detail = $d } }
+function Add-Warn([string]$n, [string]$d = '') { $script:Warned += @{ Name = $n; Detail = $d } }
+
+# ---------- 0. 环境 ----------
+if (-not (Get-Command go -ErrorAction SilentlyContinue)) { Write-Host 'go not found' -ForegroundColor Red; exit 1 }
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Host 'git not found' -ForegroundColor Red; exit 1 }
+
+$repoRoot = (& git rev-parse --show-toplevel).Trim()
+if (-not $repoRoot) { Write-Host 'not a git repo' -ForegroundColor Red; exit 1 }
+Push-Location $repoRoot
+Write-Host "repo : $repoRoot" -ForegroundColor DarkGray
+
+# ---------- 1. 基线分支 & 模块名 ----------
+if (-not $Base) {
+    foreach ($c in @('origin/main', 'origin/master', 'main', 'master', 'origin/develop')) {
+        & git rev-parse --verify $c 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $Base = $c; break }
+    }
+}
+if (-not $Base) { $Base = 'HEAD' }
+
+$module = ''
+foreach ($l in (Get-Content (Join-Path $repoRoot 'go.mod') -ErrorAction SilentlyContinue)) {
+    if ($l -match '^\s*module\s+(\S+)') { $module = $Matches[1]; break }
+}
+Write-Host "base : $Base" -ForegroundColor DarkGray
+Write-Host "module: $module" -ForegroundColor DarkGray
+
+# ---------- 2. 收集改动文件 ----------
+$changed = @()
+if ($Base -ne 'HEAD') {
+    $changed += (& git diff --name-only $Base -- '*.go' 2>$null)
+    $changed += (& git diff --cached --name-only -- '*.go' 2>$null)
+}
+$changed += (& git ls-files --others --exclude-standard -- '*.go' 2>$null)
+$changed = $changed | Where-Object { $_ } | Sort-Object -Unique
+Write-Host "changed go files: $($changed.Count)" -ForegroundColor DarkGray
+
+function ConvertTo-RepoRel([string]$p) {
+    $full = if ([System.IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $repoRoot $p }
+    try { $full = (Resolve-Path -LiteralPath $full -ErrorAction Stop).Path } catch { return $null }
+    $rel = [System.IO.Path]::GetRelativePath($repoRoot, $full)
+    return $rel.Replace('\', '/')
+}
+
+# ---------- 3. 格式检查（CRLF 安全） ----------
+Write-Step 'format (gofmt / gofumpt)'
+function Test-Formatter([string[]]$files, [string]$tool) {
+    $bad = @()
+    foreach ($f in $files) {
+        $rel = ConvertTo-RepoRel $f
+        if (-not $rel -or -not (Test-Path -LiteralPath (Join-Path $repoRoot $rel))) { continue }
+        $orig = [System.IO.File]::ReadAllText((Join-Path $repoRoot $rel)) -replace "`r`n", "`n"
+        $out = & $tool $rel 2>$null
+        if ($LASTEXITCODE -ne 0) { $bad += $rel; continue }
+        $fmt = ($out -join "`n")
+        if (-not $fmt.EndsWith("`n")) { $fmt += "`n" }
+        if ($orig -ne $fmt) { $bad += $rel }
+    }
+    return $bad
+}
+
+$filesToCheck = if ($changed.Count -gt 0) { $changed } else { @() }
+if ($Fix -and $filesToCheck.Count -gt 0) {
+    foreach ($f in $filesToCheck) { & gofmt -w $f | Out-Null }
+    if (Get-Command gofumpt -ErrorAction SilentlyContinue) { foreach ($f in $filesToCheck) { & gofumpt -w $f | Out-Null } }
+    Write-Host "formatted $($filesToCheck.Count) file(s)" -ForegroundColor Yellow
+    Add-Pass 'format' "auto-fixed (gofmt -w)"
+} elseif ($filesToCheck.Count -eq 0) {
+    Write-Host 'no changed go files, skipped' -ForegroundColor DarkGray
+    Add-Pass 'format' 'no changes'
+} else {
+    $badFmt = Test-Formatter $filesToCheck 'gofmt'
+    if ($badFmt.Count -eq 0) {
+        Write-Host "gofmt OK" -ForegroundColor Green
+        Add-Pass 'format' 'gofmt clean'
+    } else {
+        Write-Host "gofmt needs fix:" -ForegroundColor Red
+        $badFmt | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+        Add-Fail 'format' ($badFmt -join ', ')
+    }
+    if (Get-Command gofumpt -ErrorAction SilentlyContinue) {
+        $badFumpt = Test-Formatter $filesToCheck 'gofumpt'
+        if ($badFumpt.Count -eq 0) { Write-Host 'gofumpt OK' -ForegroundColor Green }
+        else {
+            Write-Host 'gofumpt needs fix:' -ForegroundColor Yellow
+            $badFumpt | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+            Add-Warn 'gofumpt' ($badFumpt -join ', ')
+        }
+    } else { Write-Host 'gofumpt not installed, skipped' -ForegroundColor DarkGray }
+}
+
+# ---------- 4. go vet ----------
+Write-Step 'go vet ./...'
+$vetOut = & go vet ./... 2>&1
+if ($LASTEXITCODE -eq 0) { Write-Host 'vet OK' -ForegroundColor Green; Add-Pass 'go vet' '' }
+else { Write-Host ($vetOut -join "`n") -ForegroundColor Red; Add-Fail 'go vet' 'see output above' }
+
+# ---------- 5. go build ----------
+Write-Step 'go build ./...'
+$buildOut = & go build ./... 2>&1
+if ($LASTEXITCODE -eq 0) { Write-Host 'build OK' -ForegroundColor Green; Add-Pass 'go build' '' }
+else { Write-Host ($buildOut -join "`n") -ForegroundColor Red; Add-Fail 'go build' 'see output above' }
+
+# ---------- 6. go test + 覆盖率 ----------
+Write-Step 'go test with coverage'
+$covFile = Join-Path $repoRoot 'coverage.out'
+Remove-Item $covFile -ErrorAction SilentlyContinue
+$testOut = & go test "-gcflags=all=-l" "-coverprofile=coverage.out" ./... 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ($testOut -join "`n") -ForegroundColor Red
+    Add-Fail 'go test' 'test failed'
+} else {
+    Write-Host ($testOut | Select-Object -Last 5) -ForegroundColor DarkGray
+    Add-Pass 'go test' 'all packages passed'
+}
+
+# ---------- 7. 解析 coverage.out ----------
+# 行格式: path/to/file.go:12.34,15.6 3 1
+$covMap = @{}   # relPath -> @{ lineNo = $true/$false }
+if (Test-Path $covFile) {
+    foreach ($l in (Get-Content $covFile)) {
+        if ($l -match '^(.+?):(\d+)\.\d+,(\d+)\.\d+\s+\d+\s+(\d+)$') {
+            $file = $Matches[1]; $s = [int]$Matches[2]; $e = [int]$Matches[3]; $cnt = [int]$Matches[4]
+            $rel = $file
+            if ($module -and $rel.StartsWith($module + '/')) { $rel = $rel.Substring($module.Length + 1) }
+            if (-not $covMap.ContainsKey($rel)) { $covMap[$rel] = @{} }
+            $m = $covMap[$rel]
+            for ($i = $s; $i -le $e; $i++) { if ($cnt -gt 0) { $m[$i] = $true } elseif (-not $m.ContainsKey($i)) { $m[$i] = $false } }
+        }
+    }
+}
+
+# 全量覆盖率
+$totalStmt = 0; $coveredStmt = 0
+foreach ($k in $covMap.Keys) {
+    foreach ($v in $covMap[$k].Values) { $totalStmt++; if ($v) { $coveredStmt++ } }
+}
+$fullCov = if ($totalStmt -gt 0) { [math]::Round($coveredStmt * 100.0 / $totalStmt, 2) } else { -1 }
+if ($fullCov -ge 0) {
+    $msg = "total coverage: $fullCov% ($coveredStmt/$totalStmt)"
+    if ($MinCoverage -gt 0 -and $fullCov -lt $MinCoverage) { Write-Host "$msg  < $MinCoverage%" -ForegroundColor Red; Add-Fail 'coverage' $msg }
+    else { Write-Host $msg -ForegroundColor $(if ($MinCoverage -gt 0) { 'Green' } else { 'Gray' }); Add-Pass 'coverage' $msg }
+}
+
+# ---------- 8. 增量覆盖率 ----------
+Write-Step 'incremental coverage (changed lines)'
+if ($Base -eq 'HEAD') {
+    Write-Host 'no base branch, skipped' -ForegroundColor DarkGray
+} else {
+    $diffRaw = & git diff -U0 --no-color $Base -- '*.go' 2>$null
+    $curFile = $null
+    $newLine = 0
+    $addedLines = @{}   # rel -> [int[]]
+    foreach ($l in $diffRaw) {
+        if ($l -match '^\+\+\+ b/(.+)$') { $curFile = $Matches[1].Trim() }
+        elseif ($l -match '^@@ -\S+ \+(\d+)(?:,(\d+))? @@') {
+            $newLine = [int]$Matches[1]
+        }
+        elseif ($l.StartsWith('+++') -or $l.StartsWith('---')) { continue }
+        elseif ($l.StartsWith('+')) {
+            if ($curFile) {
+                if (-not $addedLines.ContainsKey($curFile)) { $addedLines[$curFile] = New-Object System.Collections.Generic.List[int] }
+                $addedLines[$curFile].Add($newLine)
+            }
+            $newLine++
+        }
+        elseif ($l.StartsWith('-')) { }
+    }
+
+    $dTotal = 0; $dCov = 0; $dSkipped = 0
+    foreach ($f in $addedLines.Keys) {
+        if (-not $IncludeTests -and $f -like '*_test.go') { continue }
+        if (-not $covMap.ContainsKey($f)) { $dSkipped += $addedLines[$f].Count; continue }
+        $m = $covMap[$f]
+        foreach ($ln in $addedLines[$f]) {
+            if ($m.ContainsKey($ln)) { $dTotal++; if ($m[$ln]) { $dCov++ } }
+        }
+    }
+    if ($dTotal -gt 0) {
+        $pct = [math]::Round($dCov * 100.0 / $dTotal, 2)
+        $msg = "changed lines covered: $pct% ($dCov/$dTotal statement-lines)"
+        if ($MinDiffCoverage -gt 0 -and $pct -lt $MinDiffCoverage) { Write-Host "$msg  < $MinDiffCoverage%" -ForegroundColor Red; Add-Fail 'diff coverage' $msg }
+        else { Write-Host $msg -ForegroundColor $(if ($MinDiffCoverage -gt 0) { 'Green' } else { 'Gray' }); Add-Pass 'diff coverage' $msg }
+    } else {
+        Write-Host "no measurable statement lines in diff (skipped $dSkipped)" -ForegroundColor DarkGray
+    }
+}
+
+# ---------- 9. 新增非测试行数 ----------
+Write-Step 'added non-test lines'
+if ($Base -ne 'HEAD') {
+    $numstat = & git diff --numstat $Base -- . ':(exclude)*_test.go' 2>$null
+    $added = 0
+    foreach ($l in $numstat) { if ($l -match '^(\d+)\s') { $added += [int]$Matches[1] } }
+    # 未跟踪文件
+    foreach ($f in (& git ls-files --others --exclude-standard -- '*.go' 2>$null)) {
+        if ($f -and -not ($f -like '*_test.go')) {
+            $p = Join-Path $repoRoot $f
+            if (Test-Path -LiteralPath $p) { $added += (Get-Content -LiteralPath $p).Count }
+        }
+    }
+    $msg = "added non-test lines: $added"
+    if ($MaxAddedLines -gt 0 -and $added -gt $MaxAddedLines) { Write-Host "$msg  > $MaxAddedLines" -ForegroundColor Red; Add-Fail 'line limit' $msg }
+    else { Write-Host $msg -ForegroundColor $(if ($MaxAddedLines -gt 0) { 'Green' } else { 'Gray' }); if ($MaxAddedLines -gt 0) { Add-Pass 'line limit' $msg } }
+}
+
+# ---------- 10. golangci-lint ----------
+if (-not $SkipLint) {
+    Write-Step 'golangci-lint'
+    if (Get-Command golangci-lint -ErrorAction SilentlyContinue) {
+        $lintOut = & golangci-lint run ./... 2>&1
+        if ($LASTEXITCODE -eq 0) { Write-Host 'lint OK' -ForegroundColor Green; Add-Pass 'lint' '' }
+        else { Write-Host ($lintOut -join "`n") -ForegroundColor Red; Add-Fail 'lint' 'see output above' }
+    } else { Write-Host 'golangci-lint not installed, skipped' -ForegroundColor DarkGray }
+}
+
+# ---------- 汇总 ----------
+Pop-Location
+Write-Host "`n================ SUMMARY ================" -ForegroundColor Cyan
+foreach ($p in $script:Passed) { Write-Host ("  PASS  {0} {1}" -f $p.Name, $p.Detail) -ForegroundColor Green }
+foreach ($w in $script:Warned) { Write-Host ("  WARN  {0} {1}" -f $w.Name, $w.Detail) -ForegroundColor Yellow }
+foreach ($f in $script:Failed) { Write-Host ("  FAIL  {0} {1}" -f $f.Name, $f.Detail) -ForegroundColor Red }
+Write-Host "==========================================" -ForegroundColor Cyan
+if ($script:Failed.Count -gt 0) { exit 1 } else { Write-Host 'All checks passed.' -ForegroundColor Green; exit 0 }

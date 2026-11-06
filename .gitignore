@@ -1,0 +1,3 @@
+# Go 构建产物与覆盖率
+*.exe
+coverage.out
